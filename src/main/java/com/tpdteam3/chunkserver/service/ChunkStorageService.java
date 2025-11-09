@@ -11,7 +11,7 @@ import java.nio.file.Paths;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 @Service
 public class ChunkStorageService {
@@ -22,10 +22,6 @@ public class ChunkStorageService {
     @Value("${server.port:9001}")
     private int serverPort;
 
-    // Almacena fragmentos en memoria (para simplificar)
-    // En producción, se escribirían a disco
-    private final Map<String, byte[]> chunkStore = new ConcurrentHashMap<>();
-
     @PostConstruct
     public void init() throws IOException {
         // Crear directorio de almacenamiento si no existe
@@ -33,82 +29,145 @@ public class ChunkStorageService {
         if (!Files.exists(path)) {
             Files.createDirectories(path);
         }
-        System.out.println("Chunkserver iniciado en puerto " + serverPort);
-        System.out.println("Almacenamiento en: " + path.toAbsolutePath());
+        System.out.println("✅ Chunkserver iniciado en puerto " + serverPort);
+        System.out.println("✅ Almacenamiento en: " + path.toAbsolutePath());
+        System.out.println("✅ Modo: PERSISTENCIA EN DISCO");
     }
 
     /**
-     * Almacena un fragmento
+     * Almacena un fragmento EN DISCO
      */
     public void writeChunk(String imagenId, int chunkIndex, String base64Data) {
-        String key = generateKey(imagenId, chunkIndex);
-        byte[] data = Base64.getDecoder().decode(base64Data);
-        chunkStore.put(key, data);
+        try {
+            String filename = generateFilename(imagenId, chunkIndex);
+            Path filePath = Paths.get(storagePath, filename);
 
-        System.out.println("Fragmento almacenado: " + key + " (" + data.length + " bytes)");
+            byte[] data = Base64.getDecoder().decode(base64Data);
+            Files.write(filePath, data);
+
+            System.out.println("✅ Fragmento guardado en disco: " + filename + " (" + data.length + " bytes)");
+        } catch (IOException e) {
+            throw new RuntimeException("Error escribiendo fragmento a disco: " + e.getMessage(), e);
+        }
     }
 
     /**
-     * Lee un fragmento
+     * Lee un fragmento DESDE DISCO
      */
     public byte[] readChunk(String imagenId, int chunkIndex) {
-        String key = generateKey(imagenId, chunkIndex);
-        byte[] data = chunkStore.get(key);
+        try {
+            String filename = generateFilename(imagenId, chunkIndex);
+            Path filePath = Paths.get(storagePath, filename);
 
-        if (data == null) {
-            throw new RuntimeException("Fragmento no encontrado: " + key);
+            if (!Files.exists(filePath)) {
+                throw new RuntimeException("Fragmento no encontrado: " + filename);
+            }
+
+            byte[] data = Files.readAllBytes(filePath);
+            System.out.println("✅ Fragmento leído desde disco: " + filename + " (" + data.length + " bytes)");
+            return data;
+        } catch (IOException e) {
+            throw new RuntimeException("Error leyendo fragmento desde disco: " + e.getMessage(), e);
         }
-
-        System.out.println("Fragmento leído: " + key + " (" + data.length + " bytes)");
-        return data;
     }
 
     /**
-     * Elimina un fragmento
+     * Elimina un fragmento DEL DISCO
      */
     public void deleteChunk(String imagenId, int chunkIndex) {
-        String key = generateKey(imagenId, chunkIndex);
-        chunkStore.remove(key);
-        System.out.println("Fragmento eliminado: " + key);
+        try {
+            String filename = generateFilename(imagenId, chunkIndex);
+            Path filePath = Paths.get(storagePath, filename);
+
+            if (Files.exists(filePath)) {
+                Files.delete(filePath);
+                System.out.println("🗑️ Fragmento eliminado del disco: " + filename);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Error eliminando fragmento del disco: " + e.getMessage(), e);
+        }
     }
 
     /**
-     * Elimina todos los fragmentos de una imagen
+     * Elimina todos los fragmentos de una imagen DEL DISCO
      */
     public void deleteAllChunks(String imagenId) {
-        chunkStore.keySet().removeIf(key -> key.startsWith(imagenId + ":"));
-        System.out.println("Todos los fragmentos eliminados para: " + imagenId);
+        try {
+            Path dir = Paths.get(storagePath);
+            String prefix = imagenId + "_chunk_";
+
+            try (Stream<Path> files = Files.list(dir)) {
+                long deletedCount = files
+                        .filter(path -> path.getFileName().toString().startsWith(prefix))
+                        .peek(path -> {
+                            try {
+                                Files.delete(path);
+                            } catch (IOException e) {
+                                System.err.println("Error eliminando: " + path);
+                            }
+                        })
+                        .count();
+
+                System.out.println("🗑️ Eliminados " + deletedCount + " fragmentos para imagen: " + imagenId);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Error eliminando fragmentos: " + e.getMessage(), e);
+        }
     }
 
     /**
-     * Obtiene estadísticas del servidor
+     * Obtiene estadísticas del servidor (DESDE DISCO)
      */
     public Map<String, Object> getStats() {
-        Map<String, Object> stats = new HashMap<>();
-        stats.put("totalChunks", chunkStore.size());
+        try {
+            Map<String, Object> stats = new HashMap<>();
+            Path dir = Paths.get(storagePath);
 
-        long totalSize = 0;
-        for (byte[] data : chunkStore.values()) {
-            totalSize += data.length;
+            if (!Files.exists(dir)) {
+                stats.put("totalChunks", 0);
+                stats.put("totalStorageUsed", 0L);
+                stats.put("storageUsedMB", 0.0);
+                return stats;
+            }
+
+            try (Stream<Path> files = Files.list(dir)) {
+                long[] totalSize = {0};
+                long count = files
+                        .filter(Files::isRegularFile)
+                        .peek(path -> {
+                            try {
+                                totalSize[0] += Files.size(path);
+                            } catch (IOException e) {
+                                // Ignorar
+                            }
+                        })
+                        .count();
+
+                stats.put("totalChunks", count);
+                stats.put("totalStorageUsed", totalSize[0]);
+                stats.put("storageUsedMB", totalSize[0] / (1024.0 * 1024.0));
+                stats.put("storagePath", dir.toAbsolutePath().toString());
+            }
+
+            return stats;
+        } catch (IOException e) {
+            throw new RuntimeException("Error obteniendo estadísticas: " + e.getMessage(), e);
         }
-        stats.put("totalStorageUsed", totalSize);
-        stats.put("storageUsedMB", totalSize / (1024.0 * 1024.0));
-
-        return stats;
     }
 
     /**
-     * Verifica si un fragmento existe
+     * Verifica si un fragmento existe EN DISCO
      */
     public boolean chunkExists(String imagenId, int chunkIndex) {
-        String key = generateKey(imagenId, chunkIndex);
-        return chunkStore.containsKey(key);
+        String filename = generateFilename(imagenId, chunkIndex);
+        Path filePath = Paths.get(storagePath, filename);
+        return Files.exists(filePath);
     }
 
     /**
-     * Genera clave única para un fragmento
+     * Genera nombre de archivo único para un fragmento
      */
-    private String generateKey(String imagenId, int chunkIndex) {
-        return imagenId + ":" + chunkIndex;
+    private String generateFilename(String imagenId, int chunkIndex) {
+        return imagenId + "_chunk_" + chunkIndex + ".bin";
     }
 }
