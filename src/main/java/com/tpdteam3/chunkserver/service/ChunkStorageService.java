@@ -23,7 +23,7 @@ public class ChunkStorageService {
     @Value("${server.port:9001}")
     private int serverPort;
 
-    @Value("${chunkserver.id:chunkserver-1}")
+    @Value("${chunkserver.id:chunkserver-2}")
     private String chunkserverId;
 
     private Path resolvedStoragePath;
